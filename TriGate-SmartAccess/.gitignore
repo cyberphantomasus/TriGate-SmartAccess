@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+garage_env/
+venv/
+
+# Personal / sensitive data — never commit
+allowlist.json
+face_db/
+vehicle_db/
+
+# Arduino build artifacts
+build/
+*.hex
+*.bin
+
+# OS
+.DS_Store
+Thumbs.db
