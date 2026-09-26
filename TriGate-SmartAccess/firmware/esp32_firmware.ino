@@ -1,23 +1,41 @@
-/* =======================================================================
-   esp32_firmware.ino  -- PATCHED
-
-   This is YOUR file. Same pins, same commands, same screens, same
-   structure. Six defects fixed, nothing redesigned. Every change is
-   marked  // [FIX n]  and listed in DIFFS.md with the original line
-   numbers.
-
-   FIX 1  line 37   for(;;) on OLED failure froze the whole board
-   FIX 2  line 63   showScreen() every loop pass during lockout was
-                    saturating the I2C bus -- the likely OLED corruption
-   FIX 3  line 65   `return` during lockout made the board deaf to serial
-                    for 60 seconds; RESET could not reach it
-   FIX 4  line 101  delay(5000) in GRANTED blocked serial reads
-   FIX 5  line 112  delay(3000) in DENIED blocked serial reads
-   FIX 6  line 144  1.5 s of blocking beeps in triggerLockout
-
-   Everything the Pi sends still works exactly as before.
-   ======================================================================= */
-
+/*
+ * esp32_firmware.ino - TriGate ESP32-S3 firmware
+ *
+ * Corrected in the TriGate code review - Document 5 of 6.
+ * Full explanation, tests and installation steps: TriGate_Doc5_esp32_firmware.pdf
+ *
+ * Same pins, same commands, same screens as the original. Every change is
+ * marked next to the lines it touches:
+ *
+ *   FIX W1  OLED fails to start -> carry on without the screen
+ *           (was for(;;): the whole board froze and looked dead)
+ *   FIX W2  lockout: keep reading serial - RESET works, anything else is
+ *           dropped (was deaf for 60 s, then ran every stored command -
+ *           a GRANTED sent during the lockout opened the gate ~53 s later);
+ *           heartbeat keeps going; screen redrawn once a second, not
+ *           nonstop (the likely cause of the OLED corruption)
+ *   FIX W3  GRANTED no longer blocks for 5 s; the gate closes itself after
+ *           6 s only if the Pi never sent CLOSE
+ *   FIX W4  DENIED no longer blocks for 3 s; the lockout starts at once
+ *   FIX W5  I2C at 400 kHz (was the 100 kHz default)
+ *   FIX W6  CLOSE also turns the green light off and resets the screen
+ *   FIX W7  new command IDLE: stop scanning (sent by the fixed
+ *           mqtt_client.py; the original firmware ignored it)
+ *   FIX W8  RESET lets an "ACCESS DENIED" message that is already showing
+ *           finish (the original Pi software sends RESET right after
+ *           every DENIED)
+ *   FIX W9  GRANTED (and CLOSE) now clear deniedShowing too. Without this,
+ *           a GRANTED arriving within 3 s of a prior DENIED left
+ *           deniedShowing set to true; loop()'s denied-timeout code then
+ *           fired ~3 s later, saw isScanning==false && isLockedOut==false
+ *           (both true right after GRANTED), and silently repainted the
+ *           screen from "ACCESS GRANTED / Gate Opening..." to "READY" -
+ *           even though the gate was still physically open for up to 6 s
+ *           more. RESET already guarded against this (FIX W8); GRANTED
+ *           did not.
+ *
+ * Upload exactly as before - no library or board setting changes.
+ */
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -44,22 +62,12 @@ unsigned long lastHeartbeat = 0;
 unsigned long yellowBlinkTimer = 0;
 bool yellowBlinkState = false;
 bool isScanning = false;
-
-// [FIX 1] the board keeps running when the display is missing
-bool hasDisplay = false;
-unsigned long lastOledTry = 0;
-
-// [FIX 2] remember what is on screen so we only redraw on change
-String scr1 = "", scr2 = "", scr3 = "";
-
-// [FIX 4/5/6] deferred actions, replacing the blocking delay() calls
-unsigned long gateCloseAt   = 0;   // 0 = nothing pending
-unsigned long deniedClearAt = 0;
-int      beepsLeft   = 0;
-int      beepOnMs    = 0;
-int      beepOffMs   = 0;
-unsigned long beepPhase = 0;
-bool     beepHigh    = false;
+bool hasDisplay = false;            // FIX W1
+bool gateOpen = false;              // FIX W3
+unsigned long gateOpenedAt = 0;     // FIX W3
+bool deniedShowing = false;         // FIX W4
+unsigned long deniedAt = 0;         // FIX W4
+int lastLockoutShown = -1;          // FIX W2
 
 void setup() {
   Serial.begin(115200);
@@ -67,19 +75,15 @@ void setup() {
   pinMode(RED_PIN, OUTPUT);
   pinMode(YELLOW_PIN, OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
-
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);           // [FIX 2] 100 kHz default made every
-                                   // full-screen update cost ~90 ms
+  Wire.setClock(400000);   // FIX W5: default 100 kHz made every screen update ~4x slower
   hasDisplay = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   if (!hasDisplay) {
+    // FIX W1: was for(;;) - the board froze here forever: servo never
+    // attached, serial never read, looked completely dead. Carry on
+    // without the screen instead.
     Serial.println("OLED FAILED - continuing without display");
-    // [FIX 1] was: for (;;);
-    // That single line is why the board looked completely dead whenever
-    // the I2C handshake failed. It froze inside setup(), so the servo was
-    // never attached and the serial command loop was never reached.
   }
-
   for (int i = 0; i < 3; i++) {
     digitalWrite(RED_PIN, HIGH); delay(200); digitalWrite(RED_PIN, LOW);
     digitalWrite(YELLOW_PIN, HIGH); delay(200); digitalWrite(YELLOW_PIN, LOW);
@@ -90,57 +94,43 @@ void setup() {
   myServo.write(0);
   showScreen("GARAGE SYSTEM", "READY", "");
   Serial.println("ESP32_READY");
-  lastOledTry = millis();
 }
 
 void loop() {
-  unsigned long now = millis();
-
-  // ---- [FIX 4/5/6] service the deferred work first ------------------
-  serviceBeep();
-
-  if (gateCloseAt && now >= gateCloseAt) {
-    gateCloseAt = 0;
-    myServo.write(0);
-    digitalWrite(GREEN_PIN, LOW);
-    showScreen("GARAGE SYSTEM", "READY", "");
-    Serial.println("GATE_CLOSED");
+  // FIX W2: heartbeat moved up so it keeps going during a lockout too
+  if (millis() - lastHeartbeat > 10000) {
+    Serial.println("HEARTBEAT");
+    lastHeartbeat = millis();
   }
 
-  if (deniedClearAt && now >= deniedClearAt) {
-    deniedClearAt = 0;
+  // FIX W3: the gate closes itself after 6 s ONLY if the Pi never sent
+  // CLOSE (the Pi sends it at 5 s). This used to be delay(5000) inside
+  // handleCommand, which stopped serial being read for 5 s.
+  if (gateOpen && millis() - gateOpenedAt > 6000) {
+    closeGate();
+  }
+
+  // FIX W4: end of the 3 s "ACCESS DENIED" screen, without delay(3000)
+  if (deniedShowing && millis() - deniedAt > 3000) {
+    deniedShowing = false;
     digitalWrite(RED_PIN, LOW);
-    if (failCount >= 3) triggerLockout();
-    else                showScreen("GARAGE SYSTEM", "READY", "");
-  }
-
-  // [FIX 1] retry the display instead of giving up for good
-  if (!hasDisplay && now - lastOledTry > 5000) {
-    lastOledTry = now;
-    i2cRecover();
-    Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000);
-    hasDisplay = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-    if (hasDisplay) {
-      Serial.println("OLED_RECOVERED");
-      scr1 = ""; showScreen(scr1, scr2, scr3);
-    }
-  }
-
-  // ---- [FIX 3] serial is read BEFORE the lockout branch -------------
-  // In the original, lockout hit `return` at line 65 and never reached
-  // Serial.available() at line 81. The board was deaf for a full 60 s:
-  // RESET could not clear it, and every command the Pi sent in that
-  // window queued up and then executed in a burst when lockout expired.
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    handleCommand(cmd);
+    if (!isScanning && !isLockedOut) showScreen("GARAGE SYSTEM", "READY", "");
   }
 
   if (isLockedOut) {
-    unsigned long elapsed = (now - lockoutStart) / 1000;
-    int remaining = 60 - (int)elapsed;
+    // FIX W2: the old code did `return` here before ever reaching
+    // Serial.available(), so for 60 s the board was deaf: RESET could not
+    // reach it, and every command sent meanwhile piled up and ran all at
+    // once when the lockout ended. Now RESET works and anything else is
+    // read and dropped.
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd == "RESET") { handleCommand(cmd); return; }
+      if (cmd.length() > 0) Serial.println("IGNORED_LOCKOUT " + cmd);
+    }
+    unsigned long elapsed = (millis() - lockoutStart) / 1000;
+    int remaining = 60 - elapsed;
     if (remaining <= 0) {
       isLockedOut = false;
       failCount = 0;
@@ -148,28 +138,30 @@ void loop() {
       showScreen("GARAGE SYSTEM", "READY", "");
       Serial.println("LOCKOUT_CLEARED");
     } else {
-      digitalWrite(RED_PIN, (now / 500) % 2);
-      // [FIX 2] was an unconditional showScreen() on EVERY loop pass.
-      // display.display() pushes 1024 bytes over I2C; at the old 100 kHz
-      // that is ~90 ms, so the bus ran at 100% duty for 60 s straight.
-      // showScreen() now returns immediately unless the text changed, so
-      // this redraws once per second instead of ten times per second.
-      showScreen("!! LOCKOUT !!", String(remaining) + "s remaining", "");
+      digitalWrite(RED_PIN, (millis() / 500) % 2);
+      // FIX W2: was redrawn on EVERY loop pass - 1024 bytes over I2C each
+      // time, nonstop for 60 s, while the text changes once per second.
+      // That flooding is the most likely cause of the OLED corruption.
+      if (remaining != lastLockoutShown) {
+        lastLockoutShown = remaining;
+        showScreen("!! LOCKOUT !!", String(remaining) + "s remaining", "");
+      }
     }
     return;
   }
 
   if (isScanning) {
-    if (now - yellowBlinkTimer > 400) {
+    if (millis() - yellowBlinkTimer > 400) {
       yellowBlinkState = !yellowBlinkState;
       digitalWrite(YELLOW_PIN, yellowBlinkState);
-      yellowBlinkTimer = now;
+      yellowBlinkTimer = millis();
     }
   }
 
-  if (now - lastHeartbeat > 10000) {
-    Serial.println("HEARTBEAT");
-    lastHeartbeat = now;
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    handleCommand(cmd);
   }
 }
 
@@ -178,66 +170,63 @@ void handleCommand(String cmd) {
     isScanning = true;
     allLedsOff();
     showScreen("SCANNING...", "Please wait", "");
-
   } else if (cmd == "GRANTED") {
     isScanning = false;
     failCount = 0;
+    deniedShowing = false;    // FIX W9: see note above handleCommand's header
     allLedsOff();
     digitalWrite(GREEN_PIN, HIGH);
     myServo.write(90);
-    beep(2, 100, 100);                      // [FIX 4] was blocking
+    beep(100); delay(100); beep(100);
     showScreen("ACCESS GRANTED", "Welcome!", "Gate Opening...");
-
-    // [FIX 4] was: delay(5000); myServo.write(0); ...
-    // 5.3 s during which Serial was never read. The Pi's CLOSE (and any
-    // SCANNING or RESET) sat in the RX buffer and fired late.
-    //
-    // This is now a FAILSAFE, not normal operation: the Pi owns the door
-    // and should send CLOSE. If the Pi dies mid-cycle the gate still
-    // shuts, which is the behaviour you want from a crashed controller.
-    gateCloseAt = millis() + 6000;          // 6 s > the Pi's 5 s, so the
-                                            // Pi closes first in normal
-                                            // operation and the race is
-                                            // gone
-
+    gateOpen = true;            // FIX W3: was delay(5000) + close
+    gateOpenedAt = millis();
   } else if (cmd == "DENIED") {
     isScanning = false;
     failCount++;
     allLedsOff();
     digitalWrite(RED_PIN, HIGH);
-    beep(1, 1000, 0);                       // [FIX 5] was blocking
-    showScreen("ACCESS DENIED", "Unauthorized!",
-               "Attempt: " + String(failCount) + "/3");
-    deniedClearAt = millis() + 3000;        // [FIX 5] was delay(3000)
-
+    beep(1000);
+    showScreen("ACCESS DENIED", "Unauthorized!", "Attempt: " + String(failCount) + "/3");
+    if (failCount >= 3) {
+      triggerLockout();
+    } else {
+      deniedShowing = true;     // FIX W4: was delay(3000)
+      deniedAt = millis();
+    }
   } else if (cmd == "LOCKOUT") {
     triggerLockout();
-
   } else if (cmd == "OPEN") {
     myServo.write(90);
-    gateCloseAt = 0;                        // manual open stays open
     Serial.println("GATE_OPENED");
-
   } else if (cmd == "CLOSE") {
-    myServo.write(0);
-    gateCloseAt = 0;                        // the Pi closed it; cancel the
-                                            // failsafe so it cannot fire
-                                            // twice
-    digitalWrite(GREEN_PIN, LOW);
-    showScreen("GARAGE SYSTEM", "READY", "");
-    Serial.println("GATE_CLOSED");
-
+    closeGate();                // FIX W6: also turns the green LED off and
+    Serial.println("GATE_CLOSED");  // resets the screen (it used to rely on
+                                    // GRANTED's delay(5000) doing that)
+  } else if (cmd == "IDLE") {       // FIX W7: sent by the fixed mqtt_client.py
+    isScanning = false;             // stop scanning: yellow light off, and
+    digitalWrite(YELLOW_PIN, LOW);  // back to READY - unless a GRANTED or
+    if (!gateOpen && !deniedShowing) {   // DENIED screen is still showing
+      showScreen("GARAGE SYSTEM", "READY", "");
+    }
   } else if (cmd == "RESET") {
     isScanning = false;
     isLockedOut = false;
     failCount = 0;
-    gateCloseAt = 0;
-    deniedClearAt = 0;
-    beepsLeft = 0;
-    digitalWrite(BUZZER_PIN, LOW);
-    allLedsOff();
+    gateOpen = false;           // FIX W3
+    lastLockoutShown = -1;      // FIX W2
     myServo.write(0);
-    showScreen("GARAGE SYSTEM", "READY", "");
+    // FIX W8: the original Pi software sends RESET straight after every
+    // DENIED. Now that DENIED no longer blocks (W4), that RESET would wipe
+    // the "ACCESS DENIED" message at once. Let a denial that is already
+    // showing finish its 3 s; everything else about RESET is unchanged.
+    if (deniedShowing) {
+      digitalWrite(YELLOW_PIN, LOW);
+      digitalWrite(GREEN_PIN, LOW);
+    } else {
+      allLedsOff();
+      showScreen("GARAGE SYSTEM", "READY", "");
+    }
     Serial.println("RESET_OK");
   }
 }
@@ -246,33 +235,28 @@ void triggerLockout() {
   isLockedOut = true;
   isScanning = false;
   lockoutStart = millis();
-  deniedClearAt = 0;
+  lastLockoutShown = -1;        // FIX W2
+  deniedShowing = false;        // FIX W4
   allLedsOff();
-  beep(5, 200, 100);        // [FIX 6] was 5 x (beep(200)+delay(100)),
-                            // i.e. 1.5 s of blocking inside a handler
+  for (int i = 0; i < 5; i++) {
+    beep(200); delay(100);
+  }
   Serial.println("LOCKOUT_ACTIVE");
 }
 
-// ---- [FIX 4/5/6] non-blocking buzzer --------------------------------
-void beep(int times, int onMs, int offMs) {
-  beepsLeft = times; beepOnMs = onMs; beepOffMs = offMs;
-  beepPhase = millis(); beepHigh = true;
+void beep(int duration) {
   digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 
-void serviceBeep() {
-  if (beepsLeft <= 0) return;
-  unsigned long now = millis();
-  if (beepHigh && now - beepPhase >= (unsigned long)beepOnMs) {
-    digitalWrite(BUZZER_PIN, LOW);
-    beepHigh = false; beepPhase = now;
-    beepsLeft--;
-    if (beepsLeft <= 0) beepsLeft = 0;
-  } else if (!beepHigh && beepsLeft > 0 &&
-             now - beepPhase >= (unsigned long)beepOffMs) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    beepHigh = true; beepPhase = now;
-  }
+// FIX W3/W6/W9: one place that closes the gate and tidies up
+void closeGate() {
+  gateOpen = false;
+  deniedShowing = false;   // FIX W9: keep this in sync with GRANTED's reset
+  myServo.write(0);
+  digitalWrite(GREEN_PIN, LOW);
+  showScreen("GARAGE SYSTEM", "READY", "");
 }
 
 void allLedsOff() {
@@ -281,31 +265,8 @@ void allLedsOff() {
   digitalWrite(GREEN_PIN, LOW);
 }
 
-// ---- [FIX 2] I2C bus recovery ---------------------------------------
-// If a transfer was cut mid-byte -- which is exactly what a replug does
-// -- the slave can hold SDA low forever and every later begin() fails.
-// Clocking SCL until it lets go, then issuing a STOP, frees the bus.
-void i2cRecover() {
-  pinMode(I2C_SDA, INPUT_PULLUP);
-  pinMode(I2C_SCL, OUTPUT_OPEN_DRAIN);
-  digitalWrite(I2C_SCL, HIGH);
-  delayMicroseconds(5);
-  for (int i = 0; i < 9 && digitalRead(I2C_SDA) == LOW; i++) {
-    digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5);
-    digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
-  }
-  pinMode(I2C_SDA, OUTPUT_OPEN_DRAIN);
-  digitalWrite(I2C_SDA, LOW);  delayMicroseconds(5);
-  digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
-  digitalWrite(I2C_SDA, HIGH); delayMicroseconds(5);
-}
-
 void showScreen(String line1, String line2, String line3) {
-  // [FIX 2] skip the transfer entirely when nothing changed
-  if (line1 == scr1 && line2 == scr2 && line3 == scr3) return;
-  scr1 = line1; scr2 = line2; scr3 = line3;
-  if (!hasDisplay) return;                  // [FIX 1]
-
+  if (!hasDisplay) return;      // FIX W1
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
