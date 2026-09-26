@@ -20,247 +20,220 @@ vehicle, then face. A stranger's car is rejected before the expensive
 face pass runs.
 """
 
-import json
-import logging
-import time
-from pathlib import Path
-
 import cv2
+import time
+import logging
+import os  # FIX M8
+import glob  # FIX M2
 import face_recognition
-
 from layer3_face import FaceVerifier
 from mqtt_client import GarageMQTT
 
-# [FIX 1] the two layers that were never wired in ----------------------
-try:
-    from layer1_plate import PlateVerifier
-    HAS_PLATE = True
-except Exception as e:                       # file missing or import error
-    logging.warning(f"Layer 1 unavailable: {e}")
-    HAS_PLATE = False
-
-try:
-    from layer2_vehicle import VehicleVerifier
-    HAS_VEHICLE = True
-except Exception as e:
-    logging.warning(f"Layer 2 unavailable: {e}")
-    HAS_VEHICLE = False
-
-# [NEW] anti-spoofing
-try:
-    from liveness import LivenessChecker
-    HAS_LIVENESS = True
-except Exception as e:
-    logging.warning(f"Liveness unavailable: {e}")
-    HAS_LIVENESS = False
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-CAMERA = ("/dev/v4l/by-id/"
-          "usb-Rapoo_Camera_Rapoo_Camera_SN0001-video-index0")
+# FIX M2: your path first, then any camera Linux lists under /dev/v4l/by-id/
+# ("index0" is the capture node; the camera's other nodes give no picture).
+CAMERA_PATHS = ["/dev/v4l/by-id/usb-Rapoo_Camera_Rapoo_Camera_SN0001-video-index0"]
 
-# How many of the three layers must pass. Set to 3 for a strict demo, 2 if
-# your reference data is thin and you would rather not fail on stage. Say
-# which one you used when you present -- a judge will ask.
-REQUIRED_LAYERS = 3
+# FIX M1: switches for layers 1 and 2. Your CURRENT layer1_plate.py and
+# layer2_vehicle.py still have their own bugs (fixed in their documents).
+# Turned on too early, they would deny everyone. Set each to True once its
+# corrected file is installed.
+USE_LAYER1_PLATE = False   # True after document 6 (layer1_plate.py)
+USE_LAYER2_VEHICLE = False  # True after document 3 (layer2_vehicle.py)
 
-HOLD_SECONDS = 5           # must stay BELOW the firmware's 6 s failsafe
+
+def open_camera():
+    # FIX M2: was "Camera not found!" then return - after a reboot main.py
+    # could start before the camera was ready and simply exit. Now it waits.
+    while True:
+        for path in CAMERA_PATHS + sorted(glob.glob("/dev/v4l/by-id/*-video-index0")):
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                logger.info(f"Camera ready on {path}")
+                return cap
+            cap.release()
+        logger.warning("Camera not found - retrying in 2 s")
+        time.sleep(2)
 
 
-def drain(cap, n=5):
-    """[FIX 3] Throw away queued frames before making a decision.
+def load_extra_layers():
+    # FIX M1: layers 1 and 2 were never imported or called, so the system
+    # was single-factor (face only), not triple. A layer with no data yet
+    # is switched off with a message instead of denying everyone.
+    layers = []
 
-    V4L2 hands OpenCV a ring buffer and frames come out in order. After
-    any blocking call you are reading pictures from before the block. This
-    is invisible while testing (you stand still) and wrong in a demo (the
-    car moves).
-    """
-    for _ in range(n):
-        cap.grab()
+    if not USE_LAYER1_PLATE:
+        logger.warning("Layer 1 (plate) OFF - USE_LAYER1_PLATE is False in main.py")
+    else:
+        try:
+            from layer1_plate import PlateVerifier
+            plate = PlateVerifier(allowlist_path="allowlist.json")
+            if plate.allowlist:
+                layers.append(("Layer 1 (plate)", plate))
+            else:
+                logger.warning("Layer 1 (plate) OFF - no 'plates' in allowlist.json")
+        except Exception as e:
+            logger.warning(f"Layer 1 (plate) OFF - {e}")
+
+    if not USE_LAYER2_VEHICLE:
+        logger.warning("Layer 2 (vehicle) OFF - USE_LAYER2_VEHICLE is False in main.py")
+    else:
+        try:
+            from layer2_vehicle import VehicleVerifier
+            vehicle = VehicleVerifier(ref_dir="vehicle_db/accent")
+            if vehicle.ref_hists:
+                layers.append(("Layer 2 (vehicle)", vehicle))
+            else:
+                logger.warning("Layer 2 (vehicle) OFF - no photos in vehicle_db/accent/")
+        except Exception as e:
+            logger.warning(f"Layer 2 (vehicle) OFF - {e}")
+
+    return layers
+
+
+# FIX M10: follow the gate's lockout. Fix M6 makes the 3-strikes lockout
+# work for the first time - and the current firmware stops reading serial
+# during a lockout, then runs everything it was sent once it ends (a GRANTED
+# sent during the lockout opened the gate ~53 s later). So main.py must send
+# nothing while the gate is locked out.
+LOCKOUT_SECONDS = 70  # firmware lockout is 60 s; 70 s leaves a safe margin
+lockout = {"until": 0.0, "denials": 0}
+
+
+def on_esp_line(line):
+    if line == "HEARTBEAT":  # FIX M9: no heartbeat spam
+        return
+    logger.info(f"ESP32: {line}")
+    if line.startswith("LOCKOUT_ACTIVE"):  # FIX M10
+        lockout["until"] = time.time() + LOCKOUT_SECONDS
+    elif line.startswith(("LOCKOUT_CLEARED", "RESET_OK")):
+        lockout["until"] = 0.0
+        lockout["denials"] = 0
 
 
 def main():
-    logger.info("Starting TriGate — triple authentication")
+    # FIX M8: run from this file's folder, so "face_db", "allowlist.json"
+    # etc. are found even when main.py is started from somewhere else.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    # ---- layers ------------------------------------------------------
-    face_verifier = FaceVerifier(db_path="face_db",
-                                 allowlist_path="allowlist.json",
-                                 tolerance=0.5)
+    logger.info("Starting Face Auth System...")
 
-    plate_verifier = None
-    if HAS_PLATE:
-        try:
-            plate_verifier = PlateVerifier(allowlist_path="allowlist.json")
-            logger.info("Layer 1 (plate) ready")
-        except Exception as e:
-            logger.error(f"Layer 1 failed to start: {e}")
+    face_verifier = FaceVerifier(
+        db_path="face_db",
+        allowlist_path="allowlist.json",
+        tolerance=0.5,
+    )
 
-    vehicle_verifier = None
-    if HAS_VEHICLE:
-        try:
-            vehicle_verifier = VehicleVerifier(ref_dir="vehicle_db/accent")
-            if not getattr(vehicle_verifier, "ref_hists", None):
-                logger.warning("Layer 2 has NO reference photos — it will "
-                               "fail every attempt. Add images to "
-                               "vehicle_db/accent/ before demoing.")
-                vehicle_verifier = None
-            else:
-                logger.info("Layer 2 (vehicle) ready")
-        except Exception as e:
-            logger.error(f"Layer 2 failed to start: {e}")
+    extra_layers = load_extra_layers()  # FIX M1
+    logger.info(f"Active layers: {1 + len(extra_layers)} of 3 "
+                f"(Layer 3 face + {[n for n, _ in extra_layers]})")
 
-    live = LivenessChecker() if HAS_LIVENESS else None
-
-    active = sum(x is not None
-                 for x in (plate_verifier, vehicle_verifier, face_verifier))
-    logger.info(f"{active}/3 layers active, {REQUIRED_LAYERS} required")
-    if active < REQUIRED_LAYERS:
-        logger.warning("FEWER ACTIVE LAYERS THAN REQUIRED — every attempt "
-                       "will be denied. Fix the data before running.")
-
-    # ---- link --------------------------------------------------------
-    mqtt = GarageMQTT(on_door_status=lambda s: logger.info(f"ESP32: {s}"))
+    mqtt = GarageMQTT(on_door_status=on_esp_line)  # FIX M9, M10
     esp_connected = mqtt.connect()
-    logger.info("ESP32 connected!" if esp_connected else "ESP32 not connected")
+    if esp_connected:
+        logger.info("ESP32 connected!")
+    else:
+        logger.warning("ESP32 not connected")
 
-    # ---- camera ------------------------------------------------------
-    cap = cv2.VideoCapture(CAMERA)
-    if not cap.isOpened():
-        logger.error("Camera not found!")
-        return
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    logger.info("Camera ready")
+    cap = open_camera()  # FIX M2
+    logger.info("Camera ready — show your face!")
 
     cooldown = 0
+    last_frame_time = time.time()  # FIX M3
+
     try:
         while True:
             ret, frame = cap.read()
+
             if not ret:
+                # FIX M3: was a bare `continue` - an unplugged camera made
+                # this loop spin forever at 100% CPU, never recovering.
+                if time.time() - last_frame_time > 3:
+                    logger.warning("Camera lost - reconnecting")
+                    cap.release()
+                    cap = open_camera()
+                    last_frame_time = time.time()
+                else:
+                    time.sleep(0.1)
                 continue
+
+            last_frame_time = time.time()
+
             if time.time() < cooldown:
                 time.sleep(0.1)
                 continue
 
-            # [FIX 4] detect ONCE, at one scale, and reuse the result.
-            # Your original detected at fx=0.25 here and verify_frame()
-            # detected again at fx=0.5 — roughly double the cost for no
-            # extra information.
+            if time.time() < lockout["until"]:  # FIX M10
+                time.sleep(0.2)
+                continue
+
             small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
             rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             locations = face_recognition.face_locations(rgb_small)
+
             if not locations:
                 time.sleep(0.1)
                 continue
 
-            # back to full-frame coordinates (0.25 scale -> x4)
-            full_locs = [tuple(v * 4 for v in loc) for loc in locations]
-            # the driver is the largest face, not locations[0]
-            driver_loc = max(full_locs,
-                             key=lambda l: (l[2] - l[0]) * (l[1] - l[3]))
-
-            logger.info("Face detected — running layers...")
-            if esp_connected:
+            try:  # FIX M7
+                logger.info("Face detected — checking identity...")
+                # FIX M5: sends no longer depend on esp_connected. That flag
+                # was set once at startup, so if the ESP32 connected later
+                # (or reconnected) nothing was ever sent to it again.
                 mqtt.send_scanning(True)
 
-            drain(cap)                      # [FIX 3]
-            ret, frame = cap.read()
-            if not ret:
-                continue
+                result = face_verifier.verify_frame(frame)
 
-            passed, reasons = 0, []
+                # FIX M1: every active layer must pass, not only the face
+                failed = [] if result.authorized else [f"Layer 3 (face): {result.fail_reason}"]
+                if result.authorized:
+                    for name, layer in extra_layers:
+                        r = layer.verify_frame(frame)
+                        if not r.authorized:
+                            failed.append(f"{name}: {r.fail_reason}")
 
-            # -- Layer 1: plate  [FIX 1] -------------------------------
-            if plate_verifier is not None:
-                try:
-                    r1 = plate_verifier.verify_frame(frame)
-                    ok1 = getattr(r1, "authorized", getattr(r1, "passed", False))
-                    if ok1:
-                        passed += 1
-                        logger.info(f"LAYER 1 PASS | {getattr(r1, 'plate', '')}")
-                    else:
-                        reasons.append(f"plate: "
-                                       f"{getattr(r1, 'fail_reason', 'no match')}")
-                except Exception as e:
-                    reasons.append(f"plate error: {e}")
-
-            # -- Layer 2: vehicle  [FIX 1] -----------------------------
-            if vehicle_verifier is not None:
-                try:
-                    r2 = vehicle_verifier.verify_frame(frame)
-                    if r2.authorized:
-                        passed += 1
-                        logger.info(f"LAYER 2 PASS | {r2.similarity:.1f}%")
-                    else:
-                        reasons.append(f"vehicle: {r2.fail_reason}")
-                except Exception as e:
-                    reasons.append(f"vehicle error: {e}")
-
-            # -- Layer 3: face -----------------------------------------
-            result = face_verifier.verify_frame(frame)
-            if result.authorized:
-                passed += 1
-                logger.info(f"LAYER 3 PASS | {result.identity}")
-            else:
-                reasons.append(f"face: {result.fail_reason}")
-
-            # -- liveness  [NEW] ---------------------------------------
-            spoof = False
-            if live is not None and result.authorized:
-                live.reset()
-                for _ in range(24):
-                    ok, f2 = cap.read()
-                    if not ok:
-                        continue
-                    lr = live.update(f2, driver_loc)
-                    if lr.decided:
-                        break
-                if not lr.is_live:
-                    spoof = True
-                    reasons.append(f"liveness: {lr.reason}")
-                    logger.warning(f"SPOOF SUSPECTED — {lr.reason}")
-
-            # -- decision ----------------------------------------------
-            if passed >= REQUIRED_LAYERS and not spoof:
-                logger.info(f"ACCESS GRANTED — Welcome {result.identity}! "
-                            f"({passed}/3 layers)")
-                if esp_connected:
+                if not failed:
+                    logger.info(f"ACCESS GRANTED — Welcome {result.identity}!")
+                    lockout["denials"] = 0  # FIX M10
                     mqtt.send_open()
-                # [FIX 2] the race. You slept 5 s then sent CLOSE while the
-                # firmware also closed itself after delay(5000): two
-                # independent closers, no acknowledgement, undefined door
-                # state when they drift. The patched firmware makes its own
-                # close a 6 s FAILSAFE, so the Pi closing at 5 s always
-                # wins and the failsafe only fires if the Pi died.
-                time.sleep(HOLD_SECONDS)
-                if esp_connected:
+                    time.sleep(5)
                     mqtt.send_close()
-                cooldown = time.time() + 3
-            else:
-                logger.warning(f"ACCESS DENIED — {passed}/{REQUIRED_LAYERS} "
-                               f"layers | " + " | ".join(reasons))
-                if esp_connected:
+                    cooldown = time.time() + 3
+                else:
+                    logger.warning("ACCESS DENIED — " + " | ".join(failed))
                     mqtt.send_deny()
-                cooldown = time.time() + 3
+                    cooldown = time.time() + 3
+                    lockout["denials"] += 1  # FIX M10
+                    if lockout["denials"] >= 3:
+                        # don't wait for the ESP32 to say so - its message
+                        # can arrive seconds later, after a new attempt
+                        logger.warning("3 failed attempts - gate locked, pausing checks")
+                        lockout["until"] = time.time() + LOCKOUT_SECONDS
+                        lockout["denials"] = 0
+                # FIX M6: removed `mqtt.send_scanning(False)` here. It sent
+                # RESET after every attempt, which set the firmware's fail
+                # counter back to 0 - the 3-strikes lockout could never
+                # trigger. GRANTED and DENIED already stop the scanning LED.
 
-            if esp_connected:
+            except Exception as e:
+                # FIX M7: one bad frame or layer error used to kill main.py
+                logger.error(f"Attempt failed, continuing: {e}")
+                # FIX M11: send_scanning(True) above can be left "on" if the
+                # error happens before GRANTED/DENIED is sent, leaving the
+                # scanning LED stuck lit. Clear it here so a bad frame
+                # doesn't leave the indicator in the wrong state.
                 mqtt.send_scanning(False)
-                # [FIX 5] a link that died mid-session used to stay "connected"
-                if not mqtt.healthy():
-                    logger.error("link unhealthy — reconnecting")
-                    esp_connected = mqtt.reconnect()
-
-            drain(cap)                      # [FIX 3]
+                cooldown = time.time() + 3
 
     except KeyboardInterrupt:
         logger.info("Stopped.")
     finally:
         cap.release()
-        mqtt.disconnect()
+        mqtt.disconnect()  # FIX M5
 
 
 if __name__ == "__main__":
